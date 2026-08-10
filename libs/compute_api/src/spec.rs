@@ -212,6 +212,14 @@ pub struct ComputeSpec {
 
     // Databricks specific options for compute instance.
     pub databricks_settings: Option<DatabricksSettings>,
+
+    /// Name of the bootstrap template to run on this compute (e.g. "supabase").
+    /// When set, compute_ctl runs the SQL scripts under
+    /// `/usr/local/share/compute-bootstrap/{template}/{init-scripts,migrations}`
+    /// exactly once, tracked via the `neon.compute_bootstrap` table.
+    /// `None` (the default) means no bootstrap template is applied.
+    #[serde(default)]
+    pub bootstrap_template: Option<String>,
 }
 
 /// Feature flag to signal `compute_ctl` to enable certain experimental functionality.

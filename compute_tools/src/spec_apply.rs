@@ -229,6 +229,14 @@ impl ComputeNode {
                 .await?;
             }
 
+            // Run bootstrap template scripts (sequential, file-by-file).
+            // This must happen after CreateAndAlterRoles (LOGIN roles exist) and
+            // CreateSchemaNeon (neon schema exists for idempotency table), but before
+            // extensions and DropRoles phases.
+            if let Some(ref template) = spec.bootstrap_template {
+                run_bootstrap_template(&client, template).await?;
+            }
+
             info!("Applying RunInEachDatabase2 phase");
             let concurrency_token = Arc::new(tokio::sync::Semaphore::new(concurrency));
 
@@ -1299,5 +1307,306 @@ async fn get_operations<'a>(
             query: String::from(include_str!("sql/finalize_drop_subscriptions.sql")),
             comment: None,
         }))),
+    }
+}
+
+/// Root directory holding the bootstrap templates baked into the compute image.
+const BOOTSTRAP_TEMPLATE_ROOT: &str = "/usr/local/share/compute-bootstrap";
+
+/// Env var to override [`BOOTSTRAP_TEMPLATE_ROOT`]. Only used by tests — production
+/// computes always read from the path baked into the image.
+const BOOTSTRAP_TEMPLATE_ROOT_ENV: &str = "NEON_COMPUTE_BOOTSTRAP_ROOT";
+
+/// Sub-directories of a template, applied in this order.
+const BOOTSTRAP_TEMPLATE_DIRS: &[&str] = &["init-scripts", "migrations"];
+
+/// Resolve the bootstrap template root, honoring the test-only env override.
+fn bootstrap_template_root() -> std::path::PathBuf {
+    match std::env::var(BOOTSTRAP_TEMPLATE_ROOT_ENV) {
+        Ok(path) if !path.is_empty() => std::path::PathBuf::from(path),
+        _ => std::path::PathBuf::from(BOOTSTRAP_TEMPLATE_ROOT),
+    }
+}
+
+/// Run the bootstrap template scripts baked into the compute image.
+///
+/// Scripts live under `{BOOTSTRAP_TEMPLATE_ROOT}/{template}/{init-scripts,migrations}` and
+/// are executed as the current (privileged) connection role, file by file, sorted by file
+/// name. Each file is sent as a single `simple_query` call — Postgres parses and runs all
+/// statements in the file within one protocol message (implicit transaction for
+/// multi-statement strings, no BEGIN/COMMIT unless the script includes them explicitly).
+///
+/// **Important constraints:**
+/// - Files must contain **pure SQL only**. psql meta-commands (`\connect`, `\set`, `\i`,
+///   `\ir`, `\copy`, etc.) are NOT supported and will cause a syntax error.
+/// - Unlike `psql -f`, which sends statements one by one and can handle meta-commands,
+///   `simple_query` sends the entire file as one text blob to the backend. Authors of
+///   bootstrap scripts must strip all psql-specific directives before packaging.
+///
+/// This is idempotent: a successful run records the template in `neon.compute_bootstrap`, so
+/// pod restarts and reconfigures don't re-run the scripts. The marker is only written after
+/// all files succeeded, so a failed run is retried on the next `/configure`.
+async fn run_bootstrap_template(client: &Client, template: &str) -> Result<()> {
+    // Guard against path traversal: the template name comes from the spec, and is
+    // interpolated into a filesystem path.
+    validate_template_name(template)?;
+
+    let span = info_span!("run_bootstrap_template", template = template);
+    async move {
+        // The `neon` schema already exists at this point (CreateSchemaNeon phase).
+        client
+            .simple_query(
+                "CREATE TABLE IF NOT EXISTS neon.compute_bootstrap (\
+                     template text PRIMARY KEY, \
+                     applied_at timestamptz NOT NULL DEFAULT pg_catalog.now())",
+            )
+            .await
+            .context("failed to create neon.compute_bootstrap table")?;
+
+        let done = client
+            .query_opt(
+                "SELECT 1 FROM neon.compute_bootstrap \
+                 WHERE template OPERATOR(pg_catalog.=) $1",
+                &[&template],
+            )
+            .await
+            .context("failed to check neon.compute_bootstrap")?;
+        if done.is_some() {
+            info!("bootstrap template already applied, skipping");
+            return Ok(());
+        }
+
+        let base = bootstrap_template_root().join(template);
+        if !base.is_dir() {
+            anyhow::bail!(
+                "bootstrap template directory {} does not exist in this compute image",
+                base.display()
+            );
+        }
+
+        for dir in BOOTSTRAP_TEMPLATE_DIRS {
+            let path = base.join(dir);
+            if !path.is_dir() {
+                info!("bootstrap dir {} not present, skipping", path.display());
+                continue;
+            }
+            apply_sql_dir(client, &path).await?;
+        }
+
+        client
+            .execute(
+                "INSERT INTO neon.compute_bootstrap (template) VALUES ($1) \
+                 ON CONFLICT DO NOTHING",
+                &[&template],
+            )
+            .await
+            .context("failed to record bootstrap completion")?;
+
+        info!("bootstrap template applied successfully");
+
+        Ok(())
+    }
+    .instrument(span)
+    .await
+}
+
+/// Validate a bootstrap template name before it is interpolated into a filesystem
+/// path. Only `[A-Za-z0-9_-]` is allowed, which rejects empty names, path
+/// separators, `.`/`..` traversal, and other shell/path metacharacters.
+fn validate_template_name(template: &str) -> Result<()> {
+    if template.is_empty()
+        || !template
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        anyhow::bail!("invalid bootstrap_template name: {:?}", template);
+    }
+    Ok(())
+}
+
+/// Collect every `*.sql` file directly under `dir`, sorted by file name.
+/// Non-`.sql` entries and sub-directories are ignored. The deterministic sort
+/// is what gives bootstrap scripts their ordering guarantee (Supabase relies on
+/// the numeric file-name prefixes, e.g. `00000000000000-*.sql`).
+fn collect_sql_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut files = std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read bootstrap dir {}", dir.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("failed to list bootstrap dir {}", dir.display()))?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("sql"))
+        .collect::<Vec<_>>();
+    files.sort();
+    Ok(files)
+}
+
+/// Execute every `*.sql` file in `dir`, sorted by file name, one file per
+/// `simple_query` call. Files must be pure SQL — no psql meta-commands.
+/// Multi-statement files run in implicit transaction (no explicit BEGIN/COMMIT
+/// unless the script itself contains them).
+async fn apply_sql_dir(client: &Client, dir: &std::path::Path) -> Result<()> {
+    let files = collect_sql_files(dir)?;
+
+    for file in files {
+        let sql = std::fs::read_to_string(&file)
+            .with_context(|| format!("failed to read {}", file.display()))?;
+        if sql.trim().is_empty() {
+            continue;
+        }
+        info!("applying bootstrap script {}", file.display());
+        client
+            .simple_query(&sql)
+            .await
+            .with_context(|| format!("failed to apply bootstrap script {}", file.display()))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// Helper: create a temp dir structure mimicking a bootstrap template.
+    fn make_template_dir(
+        base: &std::path::Path,
+        template: &str,
+        init_scripts: &[(&str, &str)],
+        migrations: &[(&str, &str)],
+    ) -> PathBuf {
+        let tpl_dir = base.join(template);
+        if !init_scripts.is_empty() {
+            let dir = tpl_dir.join("init-scripts");
+            fs::create_dir_all(&dir).unwrap();
+            for (name, content) in init_scripts {
+                fs::write(dir.join(name), content).unwrap();
+            }
+        }
+        if !migrations.is_empty() {
+            let dir = tpl_dir.join("migrations");
+            fs::create_dir_all(&dir).unwrap();
+            for (name, content) in migrations {
+                fs::write(dir.join(name), content).unwrap();
+            }
+        }
+        // Ensure template dir exists even with empty slices
+        fs::create_dir_all(&tpl_dir).unwrap();
+        tpl_dir
+    }
+
+    // ---------------------------------------------------------------
+    // validate_template_name tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_valid_template_names() {
+        assert!(validate_template_name("supabase").is_ok());
+        assert!(validate_template_name("my-template").is_ok());
+        assert!(validate_template_name("my_template").is_ok());
+        assert!(validate_template_name("Template123").is_ok());
+        assert!(validate_template_name("a").is_ok());
+    }
+
+    #[test]
+    fn test_invalid_template_name_empty() {
+        let err = validate_template_name("").unwrap_err();
+        assert!(err.to_string().contains("invalid bootstrap_template name"));
+    }
+
+    #[test]
+    fn test_invalid_template_name_path_traversal() {
+        assert!(validate_template_name("../etc").is_err());
+        assert!(validate_template_name("foo/bar").is_err());
+        assert!(validate_template_name("..").is_err());
+        assert!(validate_template_name(".").is_err());
+    }
+
+    #[test]
+    fn test_invalid_template_name_special_chars() {
+        assert!(validate_template_name("foo bar").is_err());
+        assert!(validate_template_name("foo;bar").is_err());
+        assert!(validate_template_name("foo$bar").is_err());
+        assert!(validate_template_name("foo\nbar").is_err());
+        assert!(validate_template_name("foo\x00bar").is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // collect_sql_files tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_collect_sql_files_sorted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(dir.join("02_second.sql"), "SELECT 2;").unwrap();
+        fs::write(dir.join("01_first.sql"), "SELECT 1;").unwrap();
+        fs::write(dir.join("03_third.sql"), "SELECT 3;").unwrap();
+        // Non-sql file should be ignored
+        fs::write(dir.join("readme.md"), "ignored").unwrap();
+        // Sub-directory should be ignored
+        fs::create_dir(dir.join("subdir.sql")).unwrap();
+
+        let files = collect_sql_files(dir).unwrap();
+        let names: Vec<&str> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["01_first.sql", "02_second.sql", "03_third.sql"]);
+    }
+
+    #[test]
+    fn test_collect_sql_files_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = collect_sql_files(tmp.path()).unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_collect_sql_files_nonexistent_dir() {
+        let result = collect_sql_files(std::path::Path::new("/nonexistent/path/xyz"));
+        assert!(result.is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // make_template_dir + structural tests (no PG needed)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_template_dir_missing_subdir_is_fine() {
+        // When only init-scripts is present but migrations dir is absent,
+        // that's valid — just means no migrations to run.
+        let tmp = tempfile::tempdir().unwrap();
+        make_template_dir(tmp.path(), "supabase", &[("01.sql", "SELECT 1;")], &[]);
+
+        let tpl = tmp.path().join("supabase");
+        assert!(tpl.join("init-scripts").is_dir());
+        assert!(!tpl.join("migrations").is_dir());
+    }
+
+    #[test]
+    fn test_file_ordering_with_supabase_prefix_convention() {
+        // Verifies the numeric-prefix convention works with sort.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(dir.join("20221207154255_vault.sql"), "vault").unwrap();
+        fs::write(dir.join("00000000000000_roles.sql"), "roles").unwrap();
+        fs::write(dir.join("20230101000000_grants.sql"), "grants").unwrap();
+
+        let files = collect_sql_files(dir).unwrap();
+        let names: Vec<&str> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "00000000000000_roles.sql",
+                "20221207154255_vault.sql",
+                "20230101000000_grants.sql"
+            ]
+        );
     }
 }

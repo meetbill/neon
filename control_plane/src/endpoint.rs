@@ -827,6 +827,7 @@ impl Endpoint {
                 offload_lfc_interval_seconds: args.offload_lfc_interval_seconds,
                 suspend_timeout_seconds: -1, // Only used in neon_local.
                 databricks_settings: None,
+                bootstrap_template: None,
             };
 
             // this strange code is needed to support respec() in tests
