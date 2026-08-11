@@ -229,14 +229,6 @@ impl ComputeNode {
                 .await?;
             }
 
-            // Run bootstrap template scripts (sequential, file-by-file).
-            // This must happen after CreateAndAlterRoles (LOGIN roles exist) and
-            // CreateSchemaNeon (neon schema exists for idempotency table), but before
-            // extensions and DropRoles phases.
-            if let Some(ref template) = spec.bootstrap_template {
-                run_bootstrap_template(&client, template).await?;
-            }
-
             info!("Applying RunInEachDatabase2 phase");
             let concurrency_token = Arc::new(tokio::sync::Semaphore::new(concurrency));
 
@@ -353,6 +345,18 @@ impl ComputeNode {
                     self.params.lakebase_mode,
                 )
                 .await?;
+            }
+
+            // Run bootstrap template scripts (sequential, file-by-file).
+            // Placed after all catalog phases so bootstrap scripts can rely on the
+            // neon extension (and other pre-installed extensions) already existing.
+            // We assume bootstrap scripts do not reference roles that DropRoles just
+            // removed (bootstrap templates own their own roles), so ordering after
+            // DropRoles is safe. Crucially, keeping bootstrap failures from aborting
+            // the extension phases means neon.* monitoring views stay available even
+            // if a bootstrap script fails.
+            if let Some(ref template) = spec.bootstrap_template {
+                run_bootstrap_template(&client, template).await?;
             }
 
             Ok::<(), anyhow::Error>(())
@@ -1343,9 +1347,24 @@ fn bootstrap_template_root() -> std::path::PathBuf {
 ///   `simple_query` sends the entire file as one text blob to the backend. Authors of
 ///   bootstrap scripts must strip all psql-specific directives before packaging.
 ///
-/// This is idempotent: a successful run records the template in `neon.compute_bootstrap`, so
-/// pod restarts and reconfigures don't re-run the scripts. The marker is only written after
-/// all files succeeded, so a failed run is retried on the next `/configure`.
+/// This is idempotent at two granularities:
+///
+/// 1. **Whole-template fast path** — once every script has succeeded, a row is written to
+///    `neon.compute_bootstrap`. On subsequent `/configure` calls the presence of that row
+///    short-circuits the whole function.
+/// 2. **Per-script resume** — each successfully-applied script is recorded in
+///    `neon.compute_bootstrap_scripts (template, script)` before the next script is run.
+///    If a script fails, the next `/configure` picks up right after the last recorded script
+///    instead of replaying from the first file. This matters because the bootstrap scripts
+///    are not universally idempotent (e.g. bare `CREATE PUBLICATION` in Supabase's
+///    `initial-schema.sql`): a naïve full replay after a partial success would hit
+///    "already exists" errors on objects the previous run created before failing.
+///
+///    The script key is stored as `"<dir>/<file_name>"` (e.g.
+///    `"init-scripts/00000000000000-initial-schema.sql"`), which is stable across image
+///    versions and independent of the mount root — safe to consult by operators via
+///    `SELECT * FROM neon.compute_bootstrap_scripts ORDER BY applied_at;` to see how far the
+///    last (possibly-failed) run got.
 async fn run_bootstrap_template(client: &Client, template: &str) -> Result<()> {
     // Guard against path traversal: the template name comes from the spec, and is
     // interpolated into a filesystem path.
@@ -1363,6 +1382,23 @@ async fn run_bootstrap_template(client: &Client, template: &str) -> Result<()> {
             .await
             .context("failed to create neon.compute_bootstrap table")?;
 
+        // Per-script progress table — records every successfully-applied script so a
+        // partially-failed run can resume without replaying earlier scripts. Kept as a
+        // separate table (rather than altering `neon.compute_bootstrap` in place) so that
+        // computes that already have a `neon.compute_bootstrap` row from a previous
+        // whole-template success are backwards-compatible.
+        client
+            .simple_query(
+                "CREATE TABLE IF NOT EXISTS neon.compute_bootstrap_scripts (\
+                     template text NOT NULL, \
+                     script text NOT NULL, \
+                     applied_at timestamptz NOT NULL DEFAULT pg_catalog.now(), \
+                     PRIMARY KEY (template, script))",
+            )
+            .await
+            .context("failed to create neon.compute_bootstrap_scripts table")?;
+
+        // Whole-template fast path.
         let done = client
             .query_opt(
                 "SELECT 1 FROM neon.compute_bootstrap \
@@ -1384,13 +1420,33 @@ async fn run_bootstrap_template(client: &Client, template: &str) -> Result<()> {
             );
         }
 
+        // If a prior partial run recorded some scripts, log how far it got — helps
+        // operators see where a previous /configure gave up.
+        let prior = client
+            .query(
+                "SELECT script FROM neon.compute_bootstrap_scripts \
+                 WHERE template OPERATOR(pg_catalog.=) $1 \
+                 ORDER BY applied_at",
+                &[&template],
+            )
+            .await
+            .context("failed to read neon.compute_bootstrap_scripts")?;
+        if !prior.is_empty() {
+            let last: &str = prior.last().unwrap().get(0);
+            info!(
+                "resuming bootstrap template: {} script(s) already applied, last was {}",
+                prior.len(),
+                last
+            );
+        }
+
         for dir in BOOTSTRAP_TEMPLATE_DIRS {
             let path = base.join(dir);
             if !path.is_dir() {
                 info!("bootstrap dir {} not present, skipping", path.display());
                 continue;
             }
-            apply_sql_dir(client, &path).await?;
+            apply_sql_dir(client, template, dir, &path).await?;
         }
 
         client
@@ -1445,10 +1501,41 @@ fn collect_sql_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
 /// `simple_query` call. Files must be pure SQL — no psql meta-commands.
 /// Multi-statement files run in implicit transaction (no explicit BEGIN/COMMIT
 /// unless the script itself contains them).
-async fn apply_sql_dir(client: &Client, dir: &std::path::Path) -> Result<()> {
+///
+/// Scripts already recorded in `neon.compute_bootstrap_scripts` are skipped, and each
+/// script is recorded there immediately after it succeeds. `dir_name` is the logical
+/// sub-directory name (e.g. `"init-scripts"`) used to build the stable script key
+/// `"<dir_name>/<file_name>"` — it must not depend on the mount root, so that the recorded
+/// keys stay valid if the image layout moves.
+async fn apply_sql_dir(
+    client: &Client,
+    template: &str,
+    dir_name: &str,
+    dir: &std::path::Path,
+) -> Result<()> {
     let files = collect_sql_files(dir)?;
 
     for file in files {
+        let file_name = file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .with_context(|| format!("bootstrap script {} has a non-UTF8 name", file.display()))?;
+        let script_key = format!("{dir_name}/{file_name}");
+
+        let already = client
+            .query_opt(
+                "SELECT 1 FROM neon.compute_bootstrap_scripts \
+                 WHERE template OPERATOR(pg_catalog.=) $1 \
+                   AND script OPERATOR(pg_catalog.=) $2",
+                &[&template, &script_key],
+            )
+            .await
+            .with_context(|| format!("failed to check bootstrap progress for {script_key}"))?;
+        if already.is_some() {
+            info!("bootstrap script {} already applied, skipping", script_key);
+            continue;
+        }
+
         let sql = std::fs::read_to_string(&file)
             .with_context(|| format!("failed to read {}", file.display()))?;
         if sql.trim().is_empty() {
@@ -1459,6 +1546,17 @@ async fn apply_sql_dir(client: &Client, dir: &std::path::Path) -> Result<()> {
             .simple_query(&sql)
             .await
             .with_context(|| format!("failed to apply bootstrap script {}", file.display()))?;
+
+        // Record progress right away so a later failure doesn't cause this script to be
+        // replayed on the next /configure.
+        client
+            .execute(
+                "INSERT INTO neon.compute_bootstrap_scripts (template, script) VALUES ($1, $2) \
+                 ON CONFLICT DO NOTHING",
+                &[&template, &script_key],
+            )
+            .await
+            .with_context(|| format!("failed to record bootstrap progress for {script_key}"))?;
     }
 
     Ok(())

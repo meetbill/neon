@@ -3,7 +3,9 @@ Integration tests for the bootstrap_template feature in compute_ctl.
 
 Tests exercise:
  - Idempotency: re-running does not re-execute scripts
- - Failure/retry: partial failure leaves no marker, next start retries
+ - Failure/retry: partial failure leaves no whole-template marker, next start retries
+ - Per-script resume: scripts already applied before a failure are not replayed,
+   which matters for non-idempotent statements (e.g. bare CREATE PUBLICATION)
  - New migration file: additional file discovered and run on re-deploy
  - Directory not found: graceful error when template doesn't exist in image
  - Script ordering: files sorted by name (numeric prefix convention)
@@ -152,6 +154,70 @@ def test_bootstrap_template_failure_retry(neon_simple_env: NeonEnv, bootstrap_ro
         cur.execute("SELECT 1 FROM neon.compute_bootstrap WHERE template = %s", (TEMPLATE_NAME,))
         assert cur.fetchone() is not None
         cur.execute("SELECT 1 FROM public.retry_test")
+
+
+def test_bootstrap_partial_failure_does_not_replay(
+    neon_simple_env: NeonEnv, bootstrap_root: Path
+):
+    """
+    Regression test for the per-script resume behavior.
+
+    A first script succeeds and creates a non-idempotent object (a publication, which
+    has no CREATE ... IF NOT EXISTS form); a later script fails. The failed run must
+    NOT write the whole-template marker, but it MUST have recorded the first script in
+    neon.compute_bootstrap_scripts — so the retry resumes at the failing script instead
+    of replaying the publication and dying on "already exists".
+    """
+    env = neon_simple_env
+
+    _write_bootstrap_scripts(
+        bootstrap_root,
+        init_scripts={
+            # Non-idempotent on replay: CREATE PUBLICATION has no IF NOT EXISTS.
+            "01_publication.sql": "CREATE PUBLICATION resume_test_pub;",
+            "02_will_fail.sql": "SELECT 1/0;",
+        },
+    )
+
+    endpoint = env.endpoints.create("main")
+    endpoint.respec(skip_pg_catalog_updates=False)
+    endpoint.respec_deep(spec={"bootstrap_template": TEMPLATE_NAME})
+
+    try:
+        endpoint.start(env={"NEON_COMPUTE_BOOTSTRAP_ROOT": str(bootstrap_root)})
+    except Exception:
+        pass  # Expected: the failing script aborts /configure
+    finally:
+        endpoint.stop()
+
+    # Fix the failing script, leave 01_publication.sql untouched.
+    init_dir = bootstrap_root / TEMPLATE_NAME / "init-scripts"
+    (init_dir / "02_will_fail.sql").write_text("SELECT 1;", encoding="utf-8")
+
+    # Retry: must succeed. Before the per-script resume fix this replayed
+    # 01_publication.sql and failed with 'publication "resume_test_pub" already exists'.
+    endpoint.start(env={"NEON_COMPUTE_BOOTSTRAP_ROOT": str(bootstrap_root)})
+
+    with endpoint.cursor() as cur:
+        # Whole-template marker written now that every script has succeeded.
+        cur.execute("SELECT 1 FROM neon.compute_bootstrap WHERE template = %s", (TEMPLATE_NAME,))
+        assert cur.fetchone() is not None
+
+        # Both scripts recorded individually.
+        cur.execute(
+            "SELECT script FROM neon.compute_bootstrap_scripts "
+            "WHERE template = %s ORDER BY script",
+            (TEMPLATE_NAME,),
+        )
+        scripts = [r[0] for r in cur.fetchall()]
+        assert scripts == [
+            "init-scripts/01_publication.sql",
+            "init-scripts/02_will_fail.sql",
+        ]
+
+        # The publication was created exactly once.
+        cur.execute("SELECT count(*) FROM pg_publication WHERE pubname = 'resume_test_pub'")
+        assert cur.fetchone()[0] == 1
 
 
 def test_bootstrap_template_dir_not_found(neon_simple_env: NeonEnv, bootstrap_root: Path):
