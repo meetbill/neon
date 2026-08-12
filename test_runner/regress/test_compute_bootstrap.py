@@ -8,6 +8,9 @@ Tests exercise:
    which matters for non-idempotent statements (e.g. bare CREATE PUBLICATION)
  - Error recording: a failed script persists its error message to
    neon.compute_bootstrap_scripts.error, cleared on successful retry
+ - Transaction-leak guard: a script with an unmatched BEGIN (no COMMIT/ROLLBACK) is
+   treated as a failure and rolled back, instead of leaking its open transaction into
+   later scripts or the progress-recording INSERTs
  - New migration file: additional file discovered and run on re-deploy
  - Directory not found: graceful error when template doesn't exist in image
  - Script ordering: files sorted by name (numeric prefix convention)
@@ -308,6 +311,92 @@ def test_bootstrap_failure_records_error(neon_simple_env: NeonEnv, bootstrap_roo
         ]
         assert all(r[1] is True for r in rows), "every script applied after retry"
         assert all(r[2] is None for r in rows), "errors cleared after successful retry"
+
+
+def test_bootstrap_leaked_transaction_is_rolled_back(
+    neon_simple_env: NeonEnv, bootstrap_root: Path
+):
+    """
+    A script with an unmatched `BEGIN` (no `COMMIT`/`ROLLBACK`) leaves the maintenance
+    connection inside an open transaction after `simple_query` returns successfully.
+    Regression test: this must be treated as a script failure (rolled back and
+    recorded with an error), not silently allowed to leak into the next script or the
+    whole-template marker — which would otherwise vanish on rollback whenever the
+    connection is later dropped, exactly like the production incident this guards
+    against.
+    """
+    env = neon_simple_env
+
+    _write_bootstrap_scripts(
+        bootstrap_root,
+        init_scripts={
+            "01_ok.sql": "CREATE TABLE IF NOT EXISTS public.leak_test (id int);",
+            # Opens a transaction and never closes it -- the bug this guards against.
+            "02_leaks_txn.sql": textwrap.dedent("""\
+                BEGIN;
+                INSERT INTO public.leak_test (id) VALUES (1);
+            """),
+            "03_after_leak.sql": "INSERT INTO public.leak_test (id) VALUES (2);",
+        },
+    )
+
+    endpoint = env.endpoints.create("main")
+    endpoint.respec(skip_pg_catalog_updates=False)
+    endpoint.respec_deep(spec={"bootstrap_template": TEMPLATE_NAME})
+
+    try:
+        endpoint.start(env={"NEON_COMPUTE_BOOTSTRAP_ROOT": str(bootstrap_root)})
+    except Exception:
+        pass  # Expected: the leaked transaction aborts /configure
+    finally:
+        endpoint.stop()
+
+    with endpoint.cursor() as cur:
+        # Whole-template marker must be absent -- the run did not fully succeed.
+        cur.execute("SELECT 1 FROM neon.compute_bootstrap WHERE template = %s", (TEMPLATE_NAME,))
+        assert cur.fetchone() is None
+
+        # The leaking script must be recorded as failed (not applied), with an error
+        # describing the leaked transaction -- and rolled back, so its own INSERT did
+        # not silently survive either.
+        cur.execute(
+            "SELECT applied_at, error FROM neon.compute_bootstrap_scripts "
+            "WHERE template = %s AND script = %s",
+            (TEMPLATE_NAME, "init-scripts/02_leaks_txn.sql"),
+        )
+        row = cur.fetchone()
+        assert row is not None
+        applied_at, error = row
+        assert applied_at is None
+        assert error is not None
+
+        # The later script must never have run -- execution stops at the leak.
+        cur.execute(
+            "SELECT 1 FROM neon.compute_bootstrap_scripts "
+            "WHERE template = %s AND script = %s",
+            (TEMPLATE_NAME, "init-scripts/03_after_leak.sql"),
+        )
+        assert cur.fetchone() is None
+
+        # The leaked INSERT itself must have been rolled back, not just unrecorded.
+        cur.execute("SELECT count(*) FROM public.leak_test")
+        assert cur.fetchone()[0] == 0
+
+    # Fix the script (close the transaction) and retry -- must succeed cleanly and
+    # resume at the fixed script rather than replaying 01_ok.sql.
+    init_dir = bootstrap_root / TEMPLATE_NAME / "init-scripts"
+    (init_dir / "02_leaks_txn.sql").write_text(
+        "INSERT INTO public.leak_test (id) VALUES (1);", encoding="utf-8"
+    )
+    endpoint.start(env={"NEON_COMPUTE_BOOTSTRAP_ROOT": str(bootstrap_root)})
+
+    with endpoint.cursor() as cur:
+        cur.execute("SELECT 1 FROM neon.compute_bootstrap WHERE template = %s", (TEMPLATE_NAME,))
+        assert cur.fetchone() is not None
+
+        cur.execute("SELECT id FROM public.leak_test ORDER BY id")
+        assert [r[0] for r in cur.fetchall()] == [1, 2]
+
 
 
 def test_bootstrap_template_dir_not_found(neon_simple_env: NeonEnv, bootstrap_root: Path):

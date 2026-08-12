@@ -1517,10 +1517,95 @@ fn collect_sql_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
     Ok(files)
 }
 
+/// Probe whether `client` is currently inside an open transaction block, using
+/// `SAVEPOINT` as the detector: PostgreSQL raises `NO_ACTIVE_SQL_TRANSACTION` (25P01) —
+/// a hard error, unlike the harmless WARNING that redundant `COMMIT`/`ROLLBACK` produce —
+/// when `SAVEPOINT` is issued outside a transaction block, and otherwise succeeds. We
+/// immediately roll back to the savepoint (a no-op on the already-applied statements) so
+/// the probe itself never changes what the script committed.
+///
+/// A transaction can also be open in its *aborted* state — e.g. a script that ran
+/// `BEGIN;` and then hit a failing statement leaves the connection in this state, which
+/// is in fact the common case for a script whose `simple_query` call itself errored.
+/// PostgreSQL rejects every statement there, including `SAVEPOINT`, with
+/// `IN_FAILED_SQL_TRANSACTION` (25P02) rather than executing it — that also counts as
+/// "transaction open" for our purposes.
+///
+/// Returns `Ok(true)` if a transaction (healthy or aborted) is open, `Ok(false)` if not,
+/// `Err` for any other unexpected failure while probing.
+async fn is_in_open_transaction(client: &Client) -> Result<bool> {
+    const PROBE: &str = "compute_ctl_txn_probe";
+    match client.simple_query(&format!("SAVEPOINT {PROBE}")).await {
+        Ok(_) => {
+            // We are inside a healthy transaction block. Release the probe savepoint
+            // (otherwise harmless, but no reason to leave it lying around).
+            client
+                .simple_query(&format!("ROLLBACK TO SAVEPOINT {PROBE}"))
+                .await
+                .context("failed to roll back transaction-leak probe savepoint")?;
+            Ok(true)
+        }
+        Err(err) if err.code() == Some(&SqlState::NO_ACTIVE_SQL_TRANSACTION) => Ok(false),
+        Err(err) if err.code() == Some(&SqlState::IN_FAILED_SQL_TRANSACTION) => Ok(true),
+        Err(err) => Err(err).context("failed to probe transaction state"),
+    }
+}
+
+/// If `client` is left inside an open transaction after running `script_key`, issue
+/// `ROLLBACK` to discard it and return an error describing the leak. Called after both
+/// the failure and success paths of a bootstrap script, so a script's transaction state
+/// never leaks into the next script or into the progress-recording `INSERT`s that follow
+/// it (which would otherwise run inside — and be discarded with — that leaked
+/// transaction the moment the connection closes).
+async fn guard_against_leaked_transaction(client: &Client, script_key: &str) -> Result<()> {
+    if is_in_open_transaction(client).await? {
+        client
+            .simple_query("ROLLBACK")
+            .await
+            .with_context(|| format!("failed to roll back transaction leaked by {script_key}"))?;
+        anyhow::bail!(
+            "bootstrap script {script_key} left an open transaction (unmatched BEGIN with no \
+             COMMIT/ROLLBACK); rolled back to avoid leaking transaction state into later steps"
+        );
+    }
+    Ok(())
+}
+
+/// Persist a bootstrap script failure to `neon.compute_bootstrap_scripts` (best-effort —
+/// a failure to record is only logged, never propagated in place of `err`) and return
+/// `err` unchanged, for use as `apply_sql_dir`'s error path.
+async fn record_script_failure(
+    client: &Client,
+    template: &str,
+    script_key: &str,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    let message = format!("{err:#}");
+    if let Err(record_err) = client
+        .execute(
+            "INSERT INTO neon.compute_bootstrap_scripts (template, script, applied_at, error) \
+             VALUES ($1, $2, NULL, $3) \
+             ON CONFLICT (template, script) DO UPDATE SET \
+                 attempted_at = pg_catalog.now(), \
+                 error = excluded.error",
+            &[&template, &script_key, &message],
+        )
+        .await
+    {
+        warn!(
+            "failed to record bootstrap failure for {}: {:#}",
+            script_key, record_err
+        );
+    }
+    err
+}
+
 /// Execute every `*.sql` file in `dir`, sorted by file name, one file per
-/// `simple_query` call. Files must be pure SQL — no psql meta-commands.
-/// Multi-statement files run in implicit transaction (no explicit BEGIN/COMMIT
-/// unless the script itself contains them).
+/// `simple_query` call. Files must be pure SQL — no psql meta-commands, and must not
+/// leave an open transaction (no unmatched `BEGIN` without `COMMIT`/`ROLLBACK`): any
+/// transaction left open after a script — on success or failure — is rolled back and
+/// treated as a script error (see `guard_against_leaked_transaction`), so that state can
+/// never leak into the next script or into the progress-recording `INSERT`s below.
 ///
 /// Scripts already successfully applied (recorded in `neon.compute_bootstrap_scripts`
 /// with `applied_at` set) are skipped. Every attempt — success or failure — is recorded:
@@ -1567,28 +1652,32 @@ async fn apply_sql_dir(
         }
         info!("applying bootstrap script {}", file.display());
         if let Err(err) = client.simple_query(&sql).await {
-            let err = anyhow::Error::from(err)
-                .context(format!("failed to apply bootstrap script {}", file.display()));
-            // Persist the failure so it survives the pod being torn down. Best-effort:
-            // if this write itself fails, still propagate the original error below.
-            let message = format!("{err:#}");
-            if let Err(record_err) = client
-                .execute(
-                    "INSERT INTO neon.compute_bootstrap_scripts (template, script, applied_at, error) \
-                     VALUES ($1, $2, NULL, $3) \
-                     ON CONFLICT (template, script) DO UPDATE SET \
-                         attempted_at = pg_catalog.now(), \
-                         error = excluded.error",
-                    &[&template, &script_key, &message],
-                )
-                .await
-            {
-                warn!(
-                    "failed to record bootstrap failure for {}: {:#}",
-                    script_key, record_err
-                );
+            let err = anyhow::Error::from(err).context(format!(
+                "failed to apply bootstrap script {}",
+                file.display()
+            ));
+            // The script may have failed mid-transaction (e.g. a bare `BEGIN` with no
+            // matching `COMMIT`/`ROLLBACK` before the failing statement). Clear any
+            // leaked transaction before recording the failure below, otherwise that
+            // INSERT would itself run inside — and be discarded with — the script's
+            // aborted transaction. We already have a real error to report, so a
+            // leak-guard failure here is only logged, not layered on top of it.
+            if let Err(leak_err) = guard_against_leaked_transaction(client, &script_key).await {
+                warn!("{:#}", leak_err);
             }
-            return Err(err);
+            return Err(record_script_failure(client, template, &script_key, err).await);
+        }
+
+        // Guard against a script leaking an open transaction on the *success* path too
+        // (e.g. `BEGIN;` with no `COMMIT;` but no error either — `simple_query` happily
+        // returns Ok while the connection is left inside that transaction). Left
+        // unchecked, every statement below — including the progress-tracking INSERT for
+        // *this* script and any later script in the same `apply_sql_dir`/whole-template
+        // run — would silently execute inside that leaked transaction and vanish on
+        // ROLLBACK the moment the connection closes. This is a script bug (BEGIN without
+        // COMMIT/ROLLBACK); fail loudly rather than silently losing progress.
+        if let Err(err) = guard_against_leaked_transaction(client, &script_key).await {
+            return Err(record_script_failure(client, template, &script_key, err).await);
         }
 
         // Record success right away so a later failure doesn't cause this script to be
