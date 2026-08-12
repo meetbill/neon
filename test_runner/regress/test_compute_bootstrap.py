@@ -6,6 +6,8 @@ Tests exercise:
  - Failure/retry: partial failure leaves no whole-template marker, next start retries
  - Per-script resume: scripts already applied before a failure are not replayed,
    which matters for non-idempotent statements (e.g. bare CREATE PUBLICATION)
+ - Error recording: a failed script persists its error message to
+   neon.compute_bootstrap_scripts.error, cleared on successful retry
  - New migration file: additional file discovered and run on re-deploy
  - Directory not found: graceful error when template doesn't exist in image
  - Script ordering: files sorted by name (numeric prefix convention)
@@ -167,6 +169,10 @@ def test_bootstrap_partial_failure_does_not_replay(
     NOT write the whole-template marker, but it MUST have recorded the first script in
     neon.compute_bootstrap_scripts — so the retry resumes at the failing script instead
     of replaying the publication and dying on "already exists".
+
+    Also verifies error recording: after the first (failing) run, the failing script's
+    row has error IS NOT NULL and applied_at IS NULL; after successful retry, error is
+    cleared and applied_at is set.
     """
     env = neon_simple_env
 
@@ -203,21 +209,105 @@ def test_bootstrap_partial_failure_does_not_replay(
         cur.execute("SELECT 1 FROM neon.compute_bootstrap WHERE template = %s", (TEMPLATE_NAME,))
         assert cur.fetchone() is not None
 
-        # Both scripts recorded individually.
+        # Both scripts recorded individually with applied_at set and error cleared.
         cur.execute(
-            "SELECT script FROM neon.compute_bootstrap_scripts "
+            "SELECT script, applied_at IS NOT NULL AS succeeded, error "
+            "FROM neon.compute_bootstrap_scripts "
             "WHERE template = %s ORDER BY script",
             (TEMPLATE_NAME,),
         )
-        scripts = [r[0] for r in cur.fetchall()]
-        assert scripts == [
-            "init-scripts/01_publication.sql",
-            "init-scripts/02_will_fail.sql",
-        ]
+        rows = cur.fetchall()
+        assert len(rows) == 2
+        assert rows[0][0] == "init-scripts/01_publication.sql"
+        assert rows[0][1] is True  # applied_at set
+        assert rows[0][2] is None  # error cleared
+        assert rows[1][0] == "init-scripts/02_will_fail.sql"
+        assert rows[1][1] is True  # applied_at set after retry
+        assert rows[1][2] is None  # error cleared after retry
 
         # The publication was created exactly once.
         cur.execute("SELECT count(*) FROM pg_publication WHERE pubname = 'resume_test_pub'")
         assert cur.fetchone()[0] == 1
+
+
+def test_bootstrap_failure_records_error(neon_simple_env: NeonEnv, bootstrap_root: Path):
+    """
+    When a bootstrap script fails, its error message must be persisted to
+    neon.compute_bootstrap_scripts.error (with applied_at left NULL), so operators
+    can see *why* a run stopped even after the pod that logged it is gone.
+
+    Then, after the script is fixed and the retry succeeds, error must be cleared and
+    applied_at set.
+
+    Note: this relies on Postgres staying up after a failed /configure (compute_ctl
+    starts PG before applying the spec), the same assumption
+    test_bootstrap_template_failure_retry already makes.
+    """
+    env = neon_simple_env
+
+    _write_bootstrap_scripts(
+        bootstrap_root,
+        init_scripts={
+            "01_ok.sql": "CREATE TABLE IF NOT EXISTS public.err_test (id int);",
+            # Reference a missing relation -> a clear, stable error message.
+            "02_boom.sql": "INSERT INTO public.does_not_exist_table VALUES (1);",
+        },
+    )
+
+    endpoint = env.endpoints.create("main")
+    endpoint.respec(skip_pg_catalog_updates=False)
+    endpoint.respec_deep(spec={"bootstrap_template": TEMPLATE_NAME})
+
+    try:
+        endpoint.start(env={"NEON_COMPUTE_BOOTSTRAP_ROOT": str(bootstrap_root)})
+    except Exception:
+        pass  # Expected: the failing script aborts /configure
+
+    # The failure must be recorded with the reason, and the whole-template marker absent.
+    with endpoint.cursor() as cur:
+        cur.execute("SELECT 1 FROM neon.compute_bootstrap WHERE template = %s", (TEMPLATE_NAME,))
+        assert cur.fetchone() is None
+
+        cur.execute(
+            "SELECT applied_at, error FROM neon.compute_bootstrap_scripts "
+            "WHERE template = %s AND script = %s",
+            (TEMPLATE_NAME, "init-scripts/02_boom.sql"),
+        )
+        row = cur.fetchone()
+        assert row is not None, "failing script must have a row recording the attempt"
+        applied_at, error = row
+        assert applied_at is None, "a failed script must not be marked applied"
+        assert error is not None
+        assert "does_not_exist_table" in error
+
+        # The earlier successful script is applied with no error.
+        cur.execute(
+            "SELECT applied_at IS NOT NULL, error FROM neon.compute_bootstrap_scripts "
+            "WHERE template = %s AND script = %s",
+            (TEMPLATE_NAME, "init-scripts/01_ok.sql"),
+        )
+        assert cur.fetchone() == (True, None)
+
+    endpoint.stop()
+
+    # Fix the script; the retry must succeed and clear the recorded error.
+    init_dir = bootstrap_root / TEMPLATE_NAME / "init-scripts"
+    (init_dir / "02_boom.sql").write_text("SELECT 1;", encoding="utf-8")
+    endpoint.start(env={"NEON_COMPUTE_BOOTSTRAP_ROOT": str(bootstrap_root)})
+
+    with endpoint.cursor() as cur:
+        cur.execute(
+            "SELECT script, applied_at IS NOT NULL, error "
+            "FROM neon.compute_bootstrap_scripts WHERE template = %s ORDER BY script",
+            (TEMPLATE_NAME,),
+        )
+        rows = cur.fetchall()
+        assert [r[0] for r in rows] == [
+            "init-scripts/01_ok.sql",
+            "init-scripts/02_boom.sql",
+        ]
+        assert all(r[1] is True for r in rows), "every script applied after retry"
+        assert all(r[2] is None for r in rows), "errors cleared after successful retry"
 
 
 def test_bootstrap_template_dir_not_found(neon_simple_env: NeonEnv, bootstrap_root: Path):

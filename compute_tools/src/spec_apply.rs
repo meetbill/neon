@@ -1352,19 +1352,32 @@ fn bootstrap_template_root() -> std::path::PathBuf {
 /// 1. **Whole-template fast path** — once every script has succeeded, a row is written to
 ///    `neon.compute_bootstrap`. On subsequent `/configure` calls the presence of that row
 ///    short-circuits the whole function.
-/// 2. **Per-script resume** — each successfully-applied script is recorded in
+/// 2. **Per-script resume** — each script's outcome is recorded in
 ///    `neon.compute_bootstrap_scripts (template, script)` before the next script is run.
-///    If a script fails, the next `/configure` picks up right after the last recorded script
-///    instead of replaying from the first file. This matters because the bootstrap scripts
-///    are not universally idempotent (e.g. bare `CREATE PUBLICATION` in Supabase's
+///    If a script fails, the next `/configure` picks up right after the last *successful*
+///    script instead of replaying from the first file. This matters because the bootstrap
+///    scripts are not universally idempotent (e.g. bare `CREATE PUBLICATION` in Supabase's
 ///    `initial-schema.sql`): a naïve full replay after a partial success would hit
 ///    "already exists" errors on objects the previous run created before failing.
 ///
 ///    The script key is stored as `"<dir>/<file_name>"` (e.g.
 ///    `"init-scripts/00000000000000-initial-schema.sql"`), which is stable across image
-///    versions and independent of the mount root — safe to consult by operators via
-///    `SELECT * FROM neon.compute_bootstrap_scripts ORDER BY applied_at;` to see how far the
-///    last (possibly-failed) run got.
+///    versions and independent of the mount root.
+///
+/// A failing script also persists its error message to the `error` column before
+/// propagating the failure, so the reason survives the pod being torn down (compute_ctl
+/// logs and the in-memory `ComputeState.error` do not survive scale-to-zero). Operators
+/// can see the full picture — how far the last run got and why it stopped — with:
+///
+/// ```sql
+/// SELECT script, applied_at, attempted_at, error
+/// FROM neon.compute_bootstrap_scripts
+/// WHERE template = '<template>'
+/// ORDER BY script;
+/// ```
+///
+/// Rows with `applied_at IS NULL AND error IS NOT NULL` are the scripts that failed;
+/// a later successful retry clears `error` and sets `applied_at`.
 async fn run_bootstrap_template(client: &Client, template: &str) -> Result<()> {
     // Guard against path traversal: the template name comes from the spec, and is
     // interpolated into a filesystem path.
@@ -1382,17 +1395,22 @@ async fn run_bootstrap_template(client: &Client, template: &str) -> Result<()> {
             .await
             .context("failed to create neon.compute_bootstrap table")?;
 
-        // Per-script progress table — records every successfully-applied script so a
-        // partially-failed run can resume without replaying earlier scripts. Kept as a
-        // separate table (rather than altering `neon.compute_bootstrap` in place) so that
-        // computes that already have a `neon.compute_bootstrap` row from a previous
-        // whole-template success are backwards-compatible.
+        // Per-script progress table — records every script's outcome so a
+        // partially-failed run can resume without replaying earlier scripts, and so the
+        // failure reason survives the pod being torn down. Kept as a separate table
+        // (rather than altering `neon.compute_bootstrap` in place) so the whole-template
+        // marker stays a simple "everything succeeded" flag.
+        //   applied_at   — set when the script succeeds; NULL while it is only attempted.
+        //   attempted_at — updated on every attempt (success or failure).
+        //   error        — last failure message; cleared to NULL once the script succeeds.
         client
             .simple_query(
                 "CREATE TABLE IF NOT EXISTS neon.compute_bootstrap_scripts (\
                      template text NOT NULL, \
                      script text NOT NULL, \
-                     applied_at timestamptz NOT NULL DEFAULT pg_catalog.now(), \
+                     applied_at timestamptz, \
+                     attempted_at timestamptz NOT NULL DEFAULT pg_catalog.now(), \
+                     error text, \
                      PRIMARY KEY (template, script))",
             )
             .await
@@ -1421,11 +1439,13 @@ async fn run_bootstrap_template(client: &Client, template: &str) -> Result<()> {
         }
 
         // If a prior partial run recorded some scripts, log how far it got — helps
-        // operators see where a previous /configure gave up.
+        // operators see where a previous /configure gave up. Only count scripts that
+        // actually succeeded; a failed attempt's row (applied_at IS NULL) is not "done".
         let prior = client
             .query(
                 "SELECT script FROM neon.compute_bootstrap_scripts \
                  WHERE template OPERATOR(pg_catalog.=) $1 \
+                   AND applied_at IS NOT NULL \
                  ORDER BY applied_at",
                 &[&template],
             )
@@ -1502,11 +1522,14 @@ fn collect_sql_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
 /// Multi-statement files run in implicit transaction (no explicit BEGIN/COMMIT
 /// unless the script itself contains them).
 ///
-/// Scripts already recorded in `neon.compute_bootstrap_scripts` are skipped, and each
-/// script is recorded there immediately after it succeeds. `dir_name` is the logical
-/// sub-directory name (e.g. `"init-scripts"`) used to build the stable script key
-/// `"<dir_name>/<file_name>"` — it must not depend on the mount root, so that the recorded
-/// keys stay valid if the image layout moves.
+/// Scripts already successfully applied (recorded in `neon.compute_bootstrap_scripts`
+/// with `applied_at` set) are skipped. Every attempt — success or failure — is recorded:
+/// on success `applied_at` is set and `error` cleared; on failure `error` is set (and
+/// `applied_at` left NULL) before the error is propagated, so the reason is visible to
+/// operators even after the pod is gone. `dir_name` is the logical sub-directory name
+/// (e.g. `"init-scripts"`) used to build the stable script key `"<dir_name>/<file_name>"`
+/// — it must not depend on the mount root, so that the recorded keys stay valid if the
+/// image layout moves.
 async fn apply_sql_dir(
     client: &Client,
     template: &str,
@@ -1526,7 +1549,8 @@ async fn apply_sql_dir(
             .query_opt(
                 "SELECT 1 FROM neon.compute_bootstrap_scripts \
                  WHERE template OPERATOR(pg_catalog.=) $1 \
-                   AND script OPERATOR(pg_catalog.=) $2",
+                   AND script OPERATOR(pg_catalog.=) $2 \
+                   AND applied_at IS NOT NULL",
                 &[&template, &script_key],
             )
             .await
@@ -1542,17 +1566,41 @@ async fn apply_sql_dir(
             continue;
         }
         info!("applying bootstrap script {}", file.display());
-        client
-            .simple_query(&sql)
-            .await
-            .with_context(|| format!("failed to apply bootstrap script {}", file.display()))?;
+        if let Err(err) = client.simple_query(&sql).await {
+            let err = anyhow::Error::from(err)
+                .context(format!("failed to apply bootstrap script {}", file.display()));
+            // Persist the failure so it survives the pod being torn down. Best-effort:
+            // if this write itself fails, still propagate the original error below.
+            let message = format!("{err:#}");
+            if let Err(record_err) = client
+                .execute(
+                    "INSERT INTO neon.compute_bootstrap_scripts (template, script, applied_at, error) \
+                     VALUES ($1, $2, NULL, $3) \
+                     ON CONFLICT (template, script) DO UPDATE SET \
+                         attempted_at = pg_catalog.now(), \
+                         error = excluded.error",
+                    &[&template, &script_key, &message],
+                )
+                .await
+            {
+                warn!(
+                    "failed to record bootstrap failure for {}: {:#}",
+                    script_key, record_err
+                );
+            }
+            return Err(err);
+        }
 
-        // Record progress right away so a later failure doesn't cause this script to be
-        // replayed on the next /configure.
+        // Record success right away so a later failure doesn't cause this script to be
+        // replayed on the next /configure. Clears any stale error from a prior attempt.
         client
             .execute(
-                "INSERT INTO neon.compute_bootstrap_scripts (template, script) VALUES ($1, $2) \
-                 ON CONFLICT DO NOTHING",
+                "INSERT INTO neon.compute_bootstrap_scripts (template, script, applied_at, error) \
+                 VALUES ($1, $2, pg_catalog.now(), NULL) \
+                 ON CONFLICT (template, script) DO UPDATE SET \
+                     applied_at = excluded.applied_at, \
+                     attempted_at = pg_catalog.now(), \
+                     error = NULL",
                 &[&template, &script_key],
             )
             .await
