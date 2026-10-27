@@ -17,6 +17,12 @@ BEGIN
         FROM pg_catalog.pg_roles
         WHERE NOT pg_catalog.pg_has_role(rolname, 'neon_superuser', 'member')
             AND NOT pg_catalog.starts_with(rolname, 'pg_')
+            AND NOT (
+                CASE
+                    WHEN pg_catalog.to_regrole('neon_bypassrls') IS NULL THEN false
+                    ELSE pg_catalog.pg_has_role(rolname, pg_catalog.to_regrole('neon_bypassrls'), 'member')
+                END
+            )
     LOOP
         IF role.bypassrls THEN
             RAISE EXCEPTION  '% can bypass RLS', pg_catalog.quote_ident(role.name);

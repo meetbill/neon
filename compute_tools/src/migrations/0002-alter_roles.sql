@@ -10,6 +10,13 @@
 -- cluster can be fixed.
 --
 -- Branching is the gift that keeps on giving...
+--
+-- Local fork exception: roles that are members of the marker group
+-- `neon_bypassrls` are intentionally allowed to keep BYPASSRLS. This lets
+-- bootstrap-template scripts provision roles that bypass RLS without having
+-- them stripped by the INC-110 cleanup below. `to_regrole()` returns NULL
+-- (instead of erroring) when the group does not exist, so clusters that never
+-- created the marker group are unaffected.
 
 DO $$
 DECLARE
@@ -23,7 +30,14 @@ BEGIN
 
     FOR role_name IN SELECT rolname FROM pg_catalog.pg_roles
         WHERE
-            NOT pg_catalog.pg_has_role(rolname, '{privileged_role_name}', 'member') AND NOT pg_catalog.starts_with(rolname, 'pg_')
+            NOT pg_catalog.pg_has_role(rolname, '{privileged_role_name}', 'member')
+            AND NOT pg_catalog.starts_with(rolname, 'pg_')
+            AND NOT (
+                CASE
+                    WHEN pg_catalog.to_regrole('neon_bypassrls') IS NULL THEN false
+                    ELSE pg_catalog.pg_has_role(rolname, pg_catalog.to_regrole('neon_bypassrls'), 'member')
+                END
+            )
     LOOP
         RAISE NOTICE 'EXECUTING ALTER ROLE % NOBYPASSRLS', pg_catalog.quote_ident(role_name);
         EXECUTE pg_catalog.format('ALTER ROLE %I NOBYPASSRLS;', role_name);
